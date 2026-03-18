@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:BuildBackend"
+
+[project]
+name = "rag-pipeline"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2",
+    "langchain-openai",
+    "openai",
+    "chromadb",
+    "rank-bm25",
+    "pydantic>=2.0",
+    "pydantic-settings",
+    "pypdf",
+    "reportlab",
+    "streamlit",
+]
+
+[project.optional-dependencies]
+hf = [
+    "transformers>=4.40",
+    "torch",
+    "accelerate",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

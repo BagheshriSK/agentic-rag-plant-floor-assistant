@@ -1,0 +1,21 @@
+# Environment
+.env
+
+# ChromaDB data
+chroma_db/
+
+# Generated PDFs (recruiter can regenerate with populate_db.py)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/settings.json
+.idea/

@@ -1,0 +1,314 @@
+# Implementation Plan: LangGraph RAG Pipeline
+
+## Overview
+
+Incremental implementation of the LangGraph-based agentic RAG pipeline for plant floor supervisors. Each task builds on the previous, ending with a fully wired graph, populated ChromaDB knowledge bases, and a working CLI entry point.
+
+## Tasks
+
+- [ ] 1. Project scaffolding
+  - Create `pyproject.toml` with dependencies: `langgraph`, `langchain-openai`, `chromadb`, `rank-bm25`, `pydantic`, `pydantic-settings`, `pypdf`, `reportlab`, `hypothesis`, `pytest`, `streamlit`
+  - Create `scripts/`, `tests/unit/`, `tests/property/` directories with `__init__.py` files
+  - Create `.env.example` with all required environment variable keys
+  - _Requirements: 2.1, 2.2_
+
+- [ ] 2. Core data models (`rag_pipeline/state.py`)
+  - [ ] 2.1 Implement `Category`, `ChunkSource`, `EvalScores`, and `PipelineState` in `state.py`
+    - `EvalScores.below_threshold(threshold)` returns `True` iff any score < threshold
+    - All list fields default to empty lists; optional fields default to `None`
+    - Add `cot_reasoning: str = ""` and `conversation_history: list[dict] = Field(default_factory=list)` to `PipelineState`
+    - Add `collection: str` field to `ChunkSource`
+    - _Requirements: 1.1, 1.2, 1.3, 1.4, 13.1, 14.1, 15.1_
+  - [ ]* 2.2 Write property test for `EvalScores.below_threshold`
+    - **Property 1: EvalScores threshold detection**
+    - **Validates: Requirements 1.4, 8.4**
+    - File: `tests/property/test_eval_scores_props.py`
+  - [ ]* 2.3 Write unit tests for `PipelineState` and `EvalScores`
+    - Test default field initialization, type constraints, `below_threshold` edge cases
+    - File: `tests/unit/test_state.py`
+    - _Requirements: 1.1, 1.2, 1.3_
+
+- [ ] 3. Configuration (`rag_pipeline/config.py`)
+  - [ ] 3.1 Implement `Settings` using `pydantic-settings` with all required fields and documented defaults
+    - Fields: `openai_api_key`, `openai_base_url`, `chat_model`, `judge_model`, `chroma_persist_dir`, `collection_safety`, `collection_maintenance`, `collection_quality`, `top_k`, `eval_threshold`, `max_retries`, `conversation_history_window` (default 5)
+    - Load from `.env` file; use defaults when env vars are absent
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 15.6_
+  - [ ]* 3.2 Write property test for `Settings` defaults
+    - **Property 12: Settings defaults are stable without environment variables**
+    - **Validates: Requirements 2.3**
+    - File: `tests/property/test_settings_props.py`
+  - [ ]* 3.3 Write unit tests for `Settings`
+    - Test field presence, types, and default values
+    - File: `tests/unit/test_config.py`
+    - _Requirements: 2.2, 2.3_
+
+- [ ] 4. Input_Validator node (`rag_pipeline/nodes/validator.py`)
+  - [ ] 4.1 Implement `validate_input(state: PipelineState) -> PipelineState`
+    - Skip if `short_circuit` is already true
+    - Reject empty/whitespace-only → set `error`, `short_circuit = True`
+    - Reject > 2000 chars → set `error`, `short_circuit = True`
+    - Strip whitespace, remove control chars (0x00–0x1F, 0x7F), normalize internal whitespace → store in `validated_query`
+    - Append sanitized query (truncated to 80 chars) or error to `reasoning_trace`
+    - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
+  - [ ]* 4.2 Write property test: validator rejects whitespace-only queries
+    - **Property 2: Input validation rejects whitespace-only queries**
+    - **Validates: Requirements 3.1**
+    - File: `tests/property/test_validator_props.py`
+  - [ ]* 4.3 Write property test: validator rejects over-length queries
+    - **Property 3: Input validation rejects over-length queries**
+    - **Validates: Requirements 3.2**
+    - File: `tests/property/test_validator_props.py`
+  - [ ]* 4.4 Write property test: validator sanitizes valid queries
+    - **Property 4: Input validation sanitizes valid queries**
+    - **Validates: Requirements 3.3**
+    - File: `tests/property/test_validator_props.py`
+  - [ ]* 4.5 Write unit tests for `validate_input`
+    - Test: empty string, single space, exactly 2000 chars, exactly 2001 chars, string with control characters, already-short-circuited state
+    - File: `tests/unit/test_validator.py`
+    - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5_
+
+- [ ] 5. Classifier node (`rag_pipeline/nodes/classifier.py`)
+  - [ ] 5.1 Implement `classify_query(state: PipelineState) -> PipelineState`
+    - Skip if `short_circuit` is true
+    - Single LLM call (temperature=0) with system prompt listing four valid categories
+    - On valid category: set `state.category`, append to `reasoning_trace`
+    - On unknown/invalid response: set `category = "unknown"`, `short_circuit = True`, set `answer` to out-of-scope message
+    - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5_
+  - [ ]* 5.2 Write property test: short-circuit skip for classifier
+    - **Property 5: Short-circuit skip — all processing nodes** (classifier slice)
+    - **Validates: Requirements 4.1, 10.4**
+    - File: `tests/property/test_short_circuit_props.py`
+  - [ ]* 5.3 Write unit tests for `classify_query`
+    - Test: mocked LLM returning each valid category, invalid string, short-circuited entry
+    - File: `tests/unit/test_classifier.py`
+    - _Requirements: 4.1, 4.2, 4.3, 4.4, 4.5_
+
+- [ ] 6. Router node (`rag_pipeline/nodes/router.py`)
+  - [ ] 6.1 Implement `route_query(state: PipelineState) -> str` as a LangGraph conditional edge function
+    - If `short_circuit` is true → return `"output"` without LLM call
+    - Single LLM call (temperature=0) listing three valid routing targets
+    - Return matched routing key or `"output"` on non-match
+    - Append routing decision and derivation method to `reasoning_trace`
+    - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6_
+  - [ ]* 6.2 Write unit tests for `route_query`
+    - Test: `short_circuit=True`, each valid routing target, invalid LLM response
+    - File: `tests/unit/test_router.py`
+    - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.6_
+
+- [ ] 7. Hybrid Retrievers (`rag_pipeline/nodes/retrievers.py`)
+  - [ ] 7.1 Implement RRF merge helper `_rrf_merge(bm25_results, vector_results, top_k) -> list`
+    - Apply `RRF(d) = Σ 1/(60 + rank_i(d))` across both ranked lists
+    - Return top `top_k` documents sorted by descending RRF score
+    - _Requirements: 6.3_
+  - [ ]* 7.2 Write property test for RRF merge correctness
+    - **Property 7: RRF merge correctness**
+    - **Validates: Requirements 6.2, 6.3**
+    - File: `tests/property/test_rrf_props.py`
+  - [ ] 7.3 Implement `_retrieve(state, collection_name) -> PipelineState`
+    - Skip if `short_circuit` is true
+    - BM25 search over in-memory corpus (up to `top_k` candidates)
+    - ChromaDB cosine-similarity vector search (up to `top_k` candidates)
+    - Merge via `_rrf_merge`, return top `top_k`
+    - Map results to `ChunkSource` list, setting `collection` to `collection_name` on each object, store in `state.chunks`
+    - On empty results: set `answer`, `short_circuit = True`, append to `reasoning_trace`
+    - Append collection name, chunk count, and `"hybrid"` strategy to `reasoning_trace`
+    - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 14.2_
+  - [ ] 7.4 Implement `retrieve_safety`, `retrieve_maintenance`, `retrieve_quality` delegating to `_retrieve`
+    - Each binds its collection name from `Settings`
+    - _Requirements: 6.1_
+  - [ ]* 7.5 Write property test: short-circuit skip for all retriever nodes
+    - **Property 5: Short-circuit skip — all processing nodes** (retriever slice)
+    - **Validates: Requirements 6.5, 10.4**
+    - File: `tests/property/test_short_circuit_props.py`
+  - [ ]* 7.6 Write unit tests for retrievers
+    - Test: mocked ChromaDB returning empty results, mocked results mapped to `ChunkSource`, short-circuited entry
+    - File: `tests/unit/test_retrievers.py`
+    - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7_
+
+- [ ] 8. Checkpoint — Ensure all tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [ ] 9. Generator node (`rag_pipeline/nodes/generator.py`)
+  - [ ] 9.1 Implement `generate_answer(state: PipelineState) -> PipelineState`
+    - Skip if `short_circuit` is true
+    - Build RAG prompt: system message instructs LLM to first output reasoning steps prefixed with `"Reasoning:"` then the final answer prefixed with `"Answer:"`, answering only from context; user message contains all chunk contents and the last `conversation_history_window` turns of `conversation_history`
+    - Call `chat_model` from config
+    - Parse LLM response: extract text after `"Reasoning:"` into `state.cot_reasoning`, text after `"Answer:"` into `state.answer`
+    - Append user query (`role="user"`) and assistant answer (`role="assistant"`) to `state.conversation_history`
+    - Append generation note to `reasoning_trace`
+    - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 13.2, 13.3, 15.2, 15.3_
+  - [ ]* 9.2 Write property test: generator prompt contains all retrieved chunks and conversation history
+    - **Property 8: Generator prompt contains all retrieved chunks and conversation history**
+    - **Validates: Requirements 7.2, 7.3, 15.2**
+    - File: `tests/property/test_generator_props.py`
+  - [ ]* 9.3 Write property test: short-circuit skip for generator
+    - **Property 5: Short-circuit skip — all processing nodes** (generator slice)
+    - **Validates: Requirements 7.1, 10.4**
+    - File: `tests/property/test_short_circuit_props.py`
+  - [ ]* 9.4 Write unit tests for `generate_answer`
+    - Test: mocked LLM response, short-circuited entry, reasoning_trace appended
+    - File: `tests/unit/test_generator.py`
+    - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5_
+
+- [ ] 10. Evaluator node (`rag_pipeline/nodes/evaluator.py`)
+  - [ ] 10.1 Implement `evaluate_answer(state: PipelineState) -> PipelineState`
+    - Skip if `short_circuit` is true
+    - Call `judge_model` with structured JSON output prompt requesting four float scores (0.0–1.0)
+    - Store scores in `EvalScores`, assign to `state.eval_scores`
+    - If any score < `eval_threshold`: set `eval_flagged = True`
+    - If `eval_flagged` and `retry_count < max_retries`: increment `retry_count`, set `short_circuit = False`
+    - Append all four scores and flagged status to `reasoning_trace`
+    - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7_
+  - [ ]* 10.2 Write property test: evaluator retry increments counter and clears short-circuit
+    - **Property 9: Evaluator retry increments counter and clears short-circuit**
+    - **Validates: Requirements 8.5**
+    - File: `tests/property/test_evaluator_props.py`
+  - [ ]* 10.3 Write property test: short-circuit skip for evaluator
+    - **Property 5: Short-circuit skip — all processing nodes** (evaluator slice)
+    - **Validates: Requirements 8.1, 10.4**
+    - File: `tests/property/test_short_circuit_props.py`
+  - [ ]* 10.4 Write property test: reasoning trace grows on every active node invocation
+    - **Property 6: Reasoning trace grows on every active node invocation**
+    - **Validates: Requirements 8.6, 11.5**
+    - File: `tests/property/test_short_circuit_props.py`
+  - [ ]* 10.5 Write unit tests for `evaluate_answer`
+    - Test: scores above threshold, scores below threshold triggering retry, scores below threshold after max retries, short-circuited entry
+    - File: `tests/unit/test_evaluator.py`
+    - _Requirements: 8.1, 8.2, 8.3, 8.4, 8.5, 8.6, 8.7_
+
+- [ ] 11. Output_Formatter node (`rag_pipeline/nodes/output_formatter.py`)
+  - [ ] 11.1 Implement `format_output(state: PipelineState) -> PipelineState`
+    - Always executes (no short-circuit skip)
+    - Error path: `final_response = {"error": state.error, "reasoning_trace": state.reasoning_trace}`
+    - Success path: assemble `final_response` with `answer`, `reasoning_steps` (from `cot_reasoning`), `sources` (collection, document, section, chunk_id per chunk), `eval_scores`, `eval_flagged`, `reasoning_trace`
+    - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 13.4, 14.3_
+  - [ ]* 11.2 Write property test: output formatter error path excludes answer, sources, scores
+    - **Property 10: Output_Formatter error path excludes answer, sources, and scores**
+    - **Validates: Requirements 9.2**
+    - File: `tests/property/test_output_formatter_props.py`
+  - [ ]* 11.3 Write property test: output formatter success path includes all required keys and citations
+    - **Property 11: Output_Formatter success path includes all required keys and citations**
+    - **Validates: Requirements 9.3, 9.4, 13.4, 14.3**
+    - File: `tests/property/test_output_formatter_props.py`
+  - [ ]* 11.4 Write unit tests for `format_output`
+    - Test: error state, full success state with chunks, state with no eval_scores
+    - File: `tests/unit/test_output_formatter.py`
+    - _Requirements: 9.1, 9.2, 9.3, 9.4, 9.5_
+
+- [ ] 12. Graph assembly (`rag_pipeline/graph.py`)
+  - [ ] 12.1 Wire all nodes into a `StateGraph(PipelineState)` and compile to `pipeline`
+    - Add nodes: `input_validator`, `classifier`, `safety_retriever`, `maintenance_retriever`, `quality_retriever`, `generator`, `evaluator`, `output_formatter`
+    - Set entry point to `input_validator`
+    - Add edge `input_validator → classifier`
+    - Add conditional edges from `classifier` via `route_query` mapping to three retrievers and `output_formatter`
+    - Add edges from each retriever to `generator`
+    - Add edge `generator → evaluator`
+    - Add conditional edges from `evaluator` via `_evaluator_edge` mapping `"retry" → generator`, `"done" → output_formatter`
+    - Add edge `output_formatter → END`
+    - Compile with `MemorySaver` as checkpointer: `pipeline = graph.compile(checkpointer=MemorySaver())`
+    - Export compiled `pipeline` object
+    - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 15.4, 15.5_
+  - [ ]* 12.2 Write end-to-end pipeline smoke test
+    - Test: full pipeline run with all LLM calls mocked, valid query reaching `final_response`
+    - Test: short-circuit path (empty query) reaches `final_response` with error key
+    - File: `tests/unit/test_graph.py`
+    - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5_
+
+- [ ] 13. Checkpoint — Ensure all tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [ ] 14. Synthetic PDF generation script (`scripts/generate_pdfs.py`)
+  - [ ] 14.1 Implement PDF generator using `reportlab` producing 9 PDFs (3 per domain) in `data/pdfs/{category}/`
+    - Safety (3 PDFs): NFPA/GHS hazard codes, lockout/tagout procedures, PPE requirements, emergency response steps
+    - Maintenance (3 PDFs): named industrial equipment (conveyor motors, hydraulic presses, CNC machines), maintenance intervals, torque tolerances, part numbers
+    - Quality (3 PDFs): inspection checklists, dimensional tolerances, defect classification codes, sampling procedures
+    - Each PDF: document title, numbered sections with headings, numbered procedural steps — structured for metadata extraction
+    - Each domain's PDF set must collectively produce ≥ 20 chunks after ingestion
+    - _Requirements: 12.1, 12.2, 12.3, 12.4, 12.5, 12.6_
+
+- [ ] 15. PDF ingestion script (`scripts/ingest_pdfs.py`)
+  - [ ] 15.1 Implement ingestion script with `--source-dir` and `--collection` CLI arguments
+    - Parse PDFs with `pypdf`; split at section boundaries or configurable character limit
+    - Extract `Chunk_Metadata` (document name, section heading, chunk_id) from each chunk
+    - Embed each chunk using the configured embedding model; insert text + metadata into the specified ChromaDB collection
+    - On parse error: log filename + reason, continue to next file
+    - Print summary: files processed, total chunks ingested, files skipped
+    - _Requirements: 12.7, 12.8, 12.9, 12.10_
+  - [ ]* 15.2 Write property test: ingestion produces chunks with valid Chunk_Metadata
+    - **Property 13: PDF ingestion produces chunks with valid Chunk_Metadata**
+    - **Validates: Requirements 12.7, 12.8**
+    - File: `tests/property/test_ingestion_props.py`
+  - [ ]* 15.3 Write unit tests for ingestion script
+    - Test: processes a directory of test PDFs, skips unreadable files, prints summary
+    - File: `tests/unit/test_ingest.py`
+    - _Requirements: 12.7, 12.8, 12.9, 12.10_
+
+- [ ] 16. Populate ChromaDB knowledge bases
+  - [ ] 16.1 Run `scripts/generate_pdfs.py` to produce all 9 synthetic PDFs under `data/pdfs/`
+    - Verify output: 3 PDFs in each of `data/pdfs/safety_procedures/`, `data/pdfs/maintenance_manuals/`, `data/pdfs/quality_control_standards/`
+    - _Requirements: 12.1, 12.5, 12.6_
+  - [ ] 16.2 Run `scripts/ingest_pdfs.py` for each category to load chunks into ChromaDB
+    - Ingest `data/pdfs/safety_procedures/` → collection `safety_procedures`
+    - Ingest `data/pdfs/maintenance_manuals/` → collection `maintenance_manuals`
+    - Ingest `data/pdfs/quality_control_standards/` → collection `quality_control_standards`
+    - Verify each collection contains ≥ 20 chunks
+    - _Requirements: 12.7, 12.8, 12.10_
+
+- [ ] 17. Entry point (`main.py`)
+  - Implement a CLI runner that accepts a query string (via `argparse` or `sys.argv`), invokes `pipeline.invoke({"raw_query": query})`, and pretty-prints `final_response`
+  - _Requirements: 10.5_
+
+- [ ] 18. Final checkpoint — Ensure all tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [ ] 19. Chain-of-Thought property and unit tests
+  - [ ]* 19.1 Write property test: CoT response parsing separates reasoning from answer
+    - **Property 14: CoT response parsing separates reasoning from answer**
+    - **Validates: Requirements 13.3**
+    - File: `tests/property/test_cot_props.py`
+  - [ ]* 19.2 Write property test: conversation history grows after each generation
+    - **Property 15: Conversation history grows after each generation**
+    - **Validates: Requirements 15.3**
+    - File: `tests/property/test_conversation_props.py`
+  - [ ]* 19.3 Write property test: retriever populates collection field on all ChunkSource objects
+    - **Property 16: Retriever populates collection field on all ChunkSource objects**
+    - **Validates: Requirements 14.2**
+    - File: `tests/property/test_rrf_props.py`
+  - [ ]* 19.4 Write property test: conversation history window limits prompt turns
+    - **Property 17: Conversation history window limits prompt turns**
+    - **Validates: Requirements 15.2, 15.6**
+    - File: `tests/property/test_conversation_props.py`
+
+- [ ] 20. Streamlit UI (`app.py`)
+  - [ ] 20.1 Implement `app.py` at the project root with Streamlit chat interface
+    - Initialize `st.session_state.thread_id` (uuid4), `st.session_state.messages`, `st.session_state.last_response` on first load
+    - Render conversation history using `st.chat_message` blocks
+    - Accept input via `st.chat_input`; on submit invoke `pipeline.invoke({"raw_query": user_input}, config={"configurable": {"thread_id": st.session_state.thread_id}})`
+    - Append user and assistant messages to `st.session_state.messages`
+    - Store full `final_response` in `st.session_state.last_response`
+    - If `final_response` contains `"error"`, display with `st.error`
+    - _Requirements: 16.1, 16.8_
+  - [ ] 20.2 Add expandable result panels after each answer
+    - "Reasoning Steps" expander: show `last_response["reasoning_steps"]` if non-empty
+    - "Sources" expander: show table of `collection`, `document`, `section`, `chunk_id` per source
+    - "Evaluation Scores" expander: show all four EvalScores dimensions
+    - _Requirements: 16.2, 16.3, 16.4_
+  - [ ] 20.3 Add sidebar PDF upload widget
+    - `st.selectbox` for target collection (`safety_procedures`, `maintenance_manuals`, `quality_control_standards`)
+    - `st.file_uploader` accepting multiple PDF files
+    - "Upload & Ingest" button: save files to `tempfile.mkdtemp()`, run `scripts/ingest_pdfs.py` via `subprocess.run`, show `st.success` or `st.error` based on return code
+    - _Requirements: 16.5, 16.6, 16.7_
+
+- [ ] 21. Final checkpoint — Ensure all tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
+## Notes
+
+- Tasks marked with `*` are optional and can be skipped for faster MVP
+- Each task references specific requirements for traceability
+- Checkpoints ensure incremental validation at key milestones
+- Property tests use Hypothesis with `@settings(max_examples=100)` and include a comment referencing the design property number
+- Unit tests and property tests are complementary — both are needed for full coverage
+- Run `scripts/generate_pdfs.py` before `scripts/ingest_pdfs.py`; ChromaDB collections must be populated before end-to-end pipeline testing
+- The Streamlit app (`app.py`) requires the pipeline to be compiled with `MemorySaver`; run with `streamlit run app.py`
+- New property test files: `tests/property/test_cot_props.py`, `tests/property/test_conversation_props.py`
