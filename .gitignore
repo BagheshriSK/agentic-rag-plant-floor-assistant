@@ -19,3 +19,6 @@ build/
 # IDE
 .vscode/settings.json
 .idea/
+
+# Zip artifacts
+*.zip
