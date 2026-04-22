@@ -4,6 +4,9 @@ An agentic Retrieval-Augmented Generation (RAG) pipeline for plant floor supervi
 
 Built with LangGraph, ChromaDB, hybrid search (BM25 + semantic), and a Streamlit UI.
 
+
+App Live: https://agentic-rag-plant-floor-assistant-production.up.railway.app
+
 ---
 
 ## Architecture
